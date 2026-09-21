@@ -1,0 +1,19 @@
+name: Hello Fork CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        required: false
+        default: "hi"
+        type: string
+
+jobs:
+  hello:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Say hello
+        run: |
+          echo "hello from fork CI: ${{ inputs.note }}"
+          nproc
+          free -m | head -2
