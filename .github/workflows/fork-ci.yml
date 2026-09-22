@@ -72,6 +72,9 @@ jobs:
       - name: Set LIBCLANG_PATH
         run: echo "LIBCLANG_PATH=${LLVM_PATH}/lib" >> $GITHUB_ENV
 
+      - name: Setup Python and uv
+        uses: ./.github/actions/setup-python
+
       - name: Bootstrap dependencies
         timeout-minutes: 45
         run: |
