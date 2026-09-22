@@ -1,0 +1,135 @@
+# Fork CI — build and test a branch of this fork on GitHub-hosted runners.
+#
+# Lives on the fork's default branch so `gh workflow run` can find it; the branch
+# under test is chosen with the `ref` input. Mirror of the gate steps in
+# servo/servo's linux-common.yml + lint.yml, minus the self-hosted runner
+# selection. sccache is enabled the same way upstream does it for forks.
+name: Fork CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch of this fork to build and test
+        required: true
+        default: main
+      profile:
+        description: Cargo profile
+        required: true
+        default: debug
+        type: choice
+        options:
+          - debug
+          - checked-release
+      unit_tests:
+        description: Run ./mach test-unit (nextest + doc)
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      wpt_dirs:
+        description: Space-separated WPT directories (empty skips WPT)
+        required: false
+        default: ""
+  push:
+    branches: [fork-ci]
+
+concurrency:
+  group: fork-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_BACKTRACE: 1
+  SHELL: /bin/bash
+
+jobs:
+  linux:
+    name: Linux (hosted, fork)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          large-packages: false
+          swap-storage: false
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "20.1"
+          directory: ${{ runner.temp }}/llvm
+
+      - name: Set LIBCLANG_PATH
+        run: echo "LIBCLANG_PATH=${LLVM_PATH}/lib" >> $GITHUB_ENV
+
+      - name: Bootstrap dependencies
+        timeout-minutes: 45
+        run: |
+          sudo apt update
+          echo "wireshark-common wireshark-common/install-setuid boolean true" | sudo debconf-set-selections
+          sudo apt install -qy tshark shellcheck xvfb
+          ./mach bootstrap --yes --skip-lints --skip-nextest
+
+      - name: Install cargo nextest
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.unit_tests == 'true' }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.140
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Enable sccache
+        run: |
+          {
+            echo "SCCACHE_GHA_ENABLED=true"
+            echo "RUSTC_WRAPPER=sccache"
+            echo "CARGO_INCREMENTAL=0"
+          } >> $GITHUB_ENV
+
+      - name: Install crown
+        run: cargo install --path support/crown
+
+      - name: Build (${{ inputs.profile || 'debug' }})
+        env:
+          RUSTFLAGS: ${{ (inputs.profile || 'debug') == 'checked-release' && '-D warnings' || '' }}
+        run: |
+          ./mach build --use-crown --locked --profile ${{ inputs.profile || 'debug' }}
+          mv target/cargo-timings target/cargo-timings-fork || true
+
+      - name: Smoketest
+        run: xvfb-run ./mach smoketest --profile ${{ inputs.profile || 'debug' }}
+
+      - name: Script tests
+        run: ./mach test-scripts
+
+      - name: Unit tests
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.unit_tests == 'true' }}
+        env:
+          NEXTEST_RETRIES: 2
+          LANG: en-US
+        run: |
+          ./mach test-unit --profile ${{ inputs.profile || 'debug' }} --nextest-profile ci
+          ./mach test-unit --profile ${{ inputs.profile || 'debug' }} --doc
+
+      - name: WPT subset
+        if: ${{ inputs.wpt_dirs != '' }}
+        run: ./mach test-wpt ${{ inputs.wpt_dirs }} --headless --processes 2
+
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-fork
+          path: target/cargo-timings-fork
+          if-no-files-found: ignore
