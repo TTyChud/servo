@@ -16,11 +16,11 @@ on:
       profile:
         description: Cargo profile
         required: true
-        default: debug
+        default: checked-release
         type: choice
         options:
-          - debug
           - checked-release
+          - release
       unit_tests:
         description: Run ./mach test-unit (nextest + doc)
         required: true
@@ -103,15 +103,15 @@ jobs:
       - name: Install crown
         run: cargo install --path support/crown
 
-      - name: Build (${{ inputs.profile || 'debug' }})
+      - name: Build (${{ inputs.profile || 'checked-release' }})
         env:
-          RUSTFLAGS: ${{ (inputs.profile || 'debug') == 'checked-release' && '-D warnings' || '' }}
+          RUSTFLAGS: ${{ (inputs.profile || 'checked-release') == 'checked-release' && '-D warnings' || '' }}
         run: |
-          ./mach build --use-crown --locked --profile ${{ inputs.profile || 'debug' }}
+          ./mach build --use-crown --locked --profile ${{ inputs.profile || 'checked-release' }}
           mv target/cargo-timings target/cargo-timings-fork || true
 
       - name: Smoketest
-        run: xvfb-run ./mach smoketest --profile ${{ inputs.profile || 'debug' }}
+        run: xvfb-run ./mach smoketest --profile ${{ inputs.profile || 'checked-release' }}
 
       - name: Script tests
         run: ./mach test-scripts
@@ -122,8 +122,8 @@ jobs:
           NEXTEST_RETRIES: 2
           LANG: en-US
         run: |
-          ./mach test-unit --profile ${{ inputs.profile || 'debug' }} --nextest-profile ci
-          ./mach test-unit --profile ${{ inputs.profile || 'debug' }} --doc
+          ./mach test-unit --profile ${{ inputs.profile || 'checked-release' }} --nextest-profile ci
+          ./mach test-unit --profile ${{ inputs.profile || 'checked-release' }} --doc
 
       - name: WPT subset
         if: ${{ inputs.wpt_dirs != '' }}
