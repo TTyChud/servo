@@ -582,6 +582,9 @@ pub(crate) struct HTMLMediaElement {
     /// initiated by a script or by the user agent itself, rather than by the media engine and to
     /// abort other running instance of the `seek` algorithm.
     current_seek_position: Cell<f64>,
+    /// Whether the player was already asked again for `current_seek_position`, after a seek
+    /// completion that reported a position differing from it by more than `SEEK_POSITION_THRESHOLD`.
+    current_seek_retried: Cell<bool>,
     /// <https://html.spec.whatwg.org/multipage/#concept-media-muted-state>
     /// > Each media element has a muted state, which is either true, false,
     /// > or "default"; it is initially "default".
@@ -710,6 +713,7 @@ impl HTMLMediaElement {
             volume: Cell::new(1.0),
             seeking: Cell::new(false),
             current_seek_position: Cell::new(f64::NAN),
+            current_seek_retried: Cell::new(false),
             resource_url: DomRefCell::new(None),
             blob_url: DomRefCell::new(None),
             played: DomRefCell::new(TimeRangesContainer::default()),
@@ -2390,6 +2394,7 @@ impl HTMLMediaElement {
         }
 
         self.current_seek_position.set(time);
+        self.current_seek_retried.set(false);
 
         // Step 12. Wait until the user agent has established whether or not the media data for the
         // new playback position is available, and, if it is, until it has decoded enough data to
@@ -3122,8 +3127,30 @@ impl HTMLMediaElement {
     fn playback_seek_done(&self, cx: &JSContext, position: f64) {
         // If the seek was initiated by script or by the user agent itself continue with the
         // following steps, otherwise abort.
+        if !self.seeking.get() {
+            return;
+        }
+
         let delta = (position - self.current_seek_position.get()).abs();
-        if !self.seeking.get() || delta > SEEK_POSITION_THRESHOLD {
+        if delta > SEEK_POSITION_THRESHOLD {
+            // The engine also completes its own seeks (e.g. the one a playback rate change issues),
+            // at a position that was never requested. Re-issue the pending seek instead of dropping
+            // the completion: nothing else clears `seeking`, which would also stop `seeked`/`ended`.
+            if self.current_seek_retried.get() {
+                return;
+            }
+
+            let Some(ref player) = *self.player.borrow() else {
+                return;
+            };
+
+            self.current_seek_retried.set(true);
+
+            let target = self.current_seek_position.get();
+            if let Err(error) = player.lock().unwrap().seek(target) {
+                error!("Could not seek player: {error:?}");
+            }
+
             return;
         }
 
