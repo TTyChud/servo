@@ -127,7 +127,7 @@ jobs:
 
       - name: WPT subset
         if: ${{ inputs.wpt_dirs != '' }}
-        run: ./mach test-wpt ${{ inputs.wpt_dirs }} --headless --processes 2
+        run: ./mach test-wpt ${{ inputs.wpt_dirs }} --headless --processes 2 --profile ${{ inputs.profile || 'checked-release' }}
 
       - name: Upload cargo timings
         if: always()
