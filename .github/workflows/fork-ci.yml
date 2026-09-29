@@ -33,6 +33,14 @@ on:
         description: Space-separated WPT directories (empty skips WPT)
         required: false
         default: ""
+      devtools:
+        description: Run ./mach test-devtools
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
   push:
     branches: [fork-ci]
 
@@ -124,6 +132,10 @@ jobs:
         run: |
           ./mach test-unit --profile ${{ inputs.profile || 'checked-release' }} --nextest-profile ci
           ./mach test-unit --profile ${{ inputs.profile || 'checked-release' }} --doc
+
+      - name: Devtools tests
+        if: ${{ inputs.devtools == 'true' }}
+        run: ./mach test-devtools --profile ${{ inputs.profile || 'checked-release' }}
 
       - name: WPT subset
         if: ${{ inputs.wpt_dirs != '' }}
