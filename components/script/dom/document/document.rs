@@ -632,6 +632,11 @@ pub(crate) struct Document {
     /// The lifetime of an intersection observer is specified at
     /// <https://github.com/w3c/IntersectionObserver/issues/525>.
     intersection_observers: DomRefCell<Vec<Dom<IntersectionObserver>>>,
+    /// > Each Document has a lazy load intersection observer, initially set to null but can be set
+    /// > to an IntersectionObserver instance.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#lazy-load-intersection-observer>
+    lazy_load_intersection_observer: DomRefCell<Option<Dom<IntersectionObserver>>>,
     /// The node that is currently highlighted by the devtools
     highlighted_dom_node: MutNullableDom<Node>,
     /// Resolved LCP candidate elements, keyed by their [LCPCandidateID].
@@ -3465,6 +3470,37 @@ impl Document {
         true
     }
 
+    /// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#start-intersection-observing-a-lazy-loading-element>
+    pub(crate) fn start_intersection_observing_a_lazy_loading_element(
+        &self,
+        cx: &mut JSContext,
+        element: &Element,
+    ) {
+        if self.lazy_load_intersection_observer.borrow().is_none() {
+            let observer = IntersectionObserver::new_lazy_load_observer(cx, self);
+            self.lazy_load_intersection_observer
+                .borrow_mut()
+                .replace(Dom::from_ref(&observer));
+        }
+
+        let observer = self.lazy_load_intersection_observer.borrow();
+        observer
+            .as_ref()
+            .expect("the lazy load intersection observer was just created")
+            .observe_target_element(element, cx.no_gc());
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#stop-intersection-observing-a-lazy-loading-element>
+    pub(crate) fn stop_intersection_observing_a_lazy_loading_element(
+        &self,
+        element: &Element,
+        no_gc: &NoGC,
+    ) {
+        if let Some(observer) = self.lazy_load_intersection_observer.borrow().as_ref() {
+            observer.unobserve_target_element(element, no_gc);
+        }
+    }
+
     /// Add an [`IntersectionObserver`] to the [`Document`], to be processed in the [`Document`]'s event loop.
     /// <https://github.com/w3c/IntersectionObserver/issues/525>
     pub(crate) fn add_intersection_observer(&self, intersection_observer: &IntersectionObserver) {
@@ -4114,6 +4150,7 @@ impl Document {
             has_trustworthy_ancestor_origin: Cell::new(has_trustworthy_ancestor_origin),
             intersection_observer_task_queued: Cell::new(false),
             intersection_observers: Default::default(),
+            lazy_load_intersection_observer: Default::default(),
             highlighted_dom_node: Default::default(),
             lcp_candidates: DomRefCell::new(Default::default()),
             paint_timing_info: Cell::new(PaintTimingInfo::now()),

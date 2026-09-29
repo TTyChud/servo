@@ -64,18 +64,23 @@ enum PipelineType {
     Navigation,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, MallocSizeOf, PartialEq)]
 pub(crate) enum ProcessingMode {
     FirstTime,
     NotFirstTime,
 }
 
 /// <https://html.spec.whatwg.org/multipage/#lazy-load-resumption-steps>
-#[derive(Clone, Copy, Default, MallocSizeOf, PartialEq)]
+#[derive(Clone, Default, MallocSizeOf, PartialEq)]
 enum LazyLoadResumptionSteps {
     #[default]
     None,
     SrcDoc,
+    Navigate {
+        url: ServoUrl,
+        referrer_policy: ReferrerPolicy,
+        mode: ProcessingMode,
+    },
 }
 
 #[dom_struct]
@@ -101,7 +106,7 @@ pub(crate) struct HTMLIFrameElement {
     current_navigation_was_lazy_loaded: Cell<bool>,
     /// <https://html.spec.whatwg.org/multipage/#lazy-load-resumption-steps>
     #[no_trace]
-    lazy_load_resumption_steps: Cell<LazyLoadResumptionSteps>,
+    lazy_load_resumption_steps: DomRefCell<LazyLoadResumptionSteps>,
     /// Keeping track of whether the iframe will be navigated
     /// outside of the processing of it's attribute(for example: form navigation).
     /// This is necessary to prevent the iframe load event steps
@@ -347,6 +352,13 @@ impl HTMLIFrameElement {
         load_data: LoadData,
         mode: ProcessingMode,
     ) {
+        // > If container is an iframe element and will lazy load element steps given container
+        // > returns true, then stop intersection-observing a lazy loading element container and set
+        // > container's lazy load resumption steps to null.
+        //
+        // <https://html.spec.whatwg.org/multipage/browsing-the-web.html#beginning-navigation>
+        self.stop_lazy_loading(cx);
+
         // Step 2. If element's content navigable's active document is not completely loaded,
         // then set historyHandling to "replace".
         let history_handling = if !self
@@ -384,6 +396,35 @@ impl HTMLIFrameElement {
         // Step 2. If element's lazy loading attribute is in the Lazy state, then return true.
         // Step 3. Return false.
         self.Loading() == "lazy"
+    }
+
+    /// > If container is an iframe element and will lazy load element steps given container returns
+    /// > true, then stop intersection-observing a lazy loading element container and set container's
+    /// > lazy load resumption steps to null.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/browsing-the-web.html#beginning-navigation>
+    pub(crate) fn stop_lazy_loading(&self, cx: &mut JSContext) {
+        if !self.will_lazy_load_element_steps() {
+            return;
+        }
+
+        let lazy_load_resumption_steps = &self.lazy_load_resumption_steps;
+        let was_deferred = *lazy_load_resumption_steps.borrow() != LazyLoadResumptionSteps::None;
+        *lazy_load_resumption_steps.borrow_mut() = LazyLoadResumptionSteps::None;
+        self.owner_document()
+            .stop_intersection_observing_a_lazy_loading_element(
+                self.upcast::<Element>(),
+                cx.no_gc(),
+            );
+
+        // Unlike other engines, which only create the child navigable of a lazy iframe once it
+        // comes near the viewport, we create its initial about:blank document eagerly and therefore
+        // suppress the load event for it while a deferred navigation may still replace it (see
+        // `iframe_load_event_steps`). Now that the deferred navigation has been cancelled, nothing
+        // is left to replace it, so it is this document that the element's load event is for.
+        if was_deferred && self.is_initial_blank_document() {
+            self.run_iframe_load_event_steps(cx);
+        }
     }
 
     /// Step 1.3. of <https://html.spec.whatwg.org/multipage/#process-the-iframe-attributes>
@@ -438,12 +479,12 @@ impl HTMLIFrameElement {
             if self.will_lazy_load_element_steps() {
                 // Step 1.2.1. Set element's lazy load resumption steps to the rest of this algorithm
                 // starting with the step labeled navigate to the srcdoc resource.
-                self.lazy_load_resumption_steps
-                    .set(LazyLoadResumptionSteps::SrcDoc);
+                *self.lazy_load_resumption_steps.borrow_mut() = LazyLoadResumptionSteps::SrcDoc;
                 // Step 1.2.2. Set element's current navigation was lazy loaded boolean to true.
                 self.mark_navigation_as_lazy_loaded(cx);
                 // Step 1.2.3. Start intersection-observing a lazy loading element for element.
-                // TODO
+                self.owner_document()
+                    .start_intersection_observing_a_lazy_loading_element(cx, element);
                 // Step 1.2.4. Return.
                 return;
             }
@@ -507,6 +548,44 @@ impl HTMLIFrameElement {
             }
             ancestor = a.parent().map(DomRoot::from_ref);
         }
+
+        // Step 2.5. Set element's current navigation was lazy loaded boolean to false.
+        self.current_navigation_was_lazy_loaded.set(false);
+
+        // Step 2.6. If the will lazy load element steps given element return true, then:
+        if self.will_lazy_load_element_steps() {
+            // Step 2.6.1. Set element's lazy load resumption steps to the rest of this algorithm
+            // starting with the step labeled navigate.
+            *self.lazy_load_resumption_steps.borrow_mut() = LazyLoadResumptionSteps::Navigate {
+                url,
+                referrer_policy,
+                mode,
+            };
+            // Step 2.6.2. Set element's current navigation was lazy loaded boolean to true.
+            self.mark_navigation_as_lazy_loaded(cx);
+            // Step 2.6.3. Start intersection-observing a lazy loading element for element.
+            self.owner_document()
+                .start_intersection_observing_a_lazy_loading_element(cx, element);
+            // Step 2.6.4. Return.
+            return;
+        }
+
+        // Step 2.7. Navigate: Navigate an iframe or frame given element, url, referrerPolicy,
+        // null, and initialInsertion.
+        self.navigate_to_url(url, referrer_policy, mode, cx);
+    }
+
+    /// The step labeled navigate of
+    /// <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>.
+    fn navigate_to_url(
+        &self,
+        url: ServoUrl,
+        referrer_policy: ReferrerPolicy,
+        mode: ProcessingMode,
+        cx: &mut JSContext,
+    ) {
+        let document = self.owner_document();
+        let window = self.owner_window();
 
         let (creator_pipeline_id, about_base_url) = if url.matches_about_blank() {
             (Some(window.pipeline_id()), Some(document.base_url()))
@@ -1154,21 +1233,37 @@ impl VirtualMethods for HTMLIFrameElement {
                     return;
                 }
 
-                // Step 1. Let resumptionSteps be the iframe element's lazy load resumption steps.
-                // Step 3. Set the iframe's lazy load resumption steps to null.
-                let previous_resumption_steps = self
-                    .lazy_load_resumption_steps
-                    .replace(LazyLoadResumptionSteps::None);
-                match previous_resumption_steps {
-                    // Step 2. If resumptionSteps is null, then return.
-                    LazyLoadResumptionSteps::None => (),
-                    LazyLoadResumptionSteps::SrcDoc => {
-                        // Step 4. Invoke resumptionSteps.
-                        self.navigate_to_the_srcdoc_resource(ProcessingMode::NotFirstTime, cx);
-                    },
-                }
+                // Step 1-4.
+                self.run_lazy_load_resumption_steps(cx);
             },
             _ => {},
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#lazy-load-resumption-steps>
+    fn run_lazy_load_resumption_steps(&self, cx: &mut JSContext) {
+        self.super_type()
+            .unwrap()
+            .run_lazy_load_resumption_steps(cx);
+
+        // Step 1. Let resumptionSteps be the iframe element's lazy load resumption steps.
+        // Step 3. Set the iframe's lazy load resumption steps to null.
+        let previous_resumption_steps = self.lazy_load_resumption_steps.take();
+        match previous_resumption_steps {
+            // Step 2. If resumptionSteps is null, then return.
+            LazyLoadResumptionSteps::None => (),
+            LazyLoadResumptionSteps::SrcDoc => {
+                // Step 4. Invoke resumptionSteps.
+                self.navigate_to_the_srcdoc_resource(ProcessingMode::NotFirstTime, cx);
+            },
+            LazyLoadResumptionSteps::Navigate {
+                url,
+                referrer_policy,
+                mode,
+            } => {
+                // Step 4. Invoke resumptionSteps.
+                self.navigate_to_url(url, referrer_policy, mode, cx);
+            },
         }
     }
 

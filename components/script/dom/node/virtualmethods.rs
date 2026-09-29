@@ -139,6 +139,15 @@ pub(crate) trait VirtualMethods {
         }
     }
 
+    /// Invoked when the user agent's lazy load intersection observer reports that this element
+    /// intersects the viewport, to continue its deferred loading.
+    /// <https://html.spec.whatwg.org/multipage/#lazy-load-resumption-steps>
+    fn run_lazy_load_resumption_steps(&self, cx: &mut JSContext) {
+        if let Some(s) = self.super_type() {
+            s.run_lazy_load_resumption_steps(cx);
+        }
+    }
+
     /// <https://dom.spec.whatwg.org/#concept-node-move-ext>
     fn moving_steps(&self, cx: &mut JSContext, context: &MoveContext) {
         if let Some(s) = self.super_type() {

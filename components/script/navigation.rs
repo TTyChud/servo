@@ -391,6 +391,19 @@ pub(crate) fn navigate(
         return;
     }
 
+    // > Let container be navigable's container. If container is an iframe element and will lazy load
+    // > element steps given container returns true, then stop intersection-observing a lazy loading
+    // > element container and set container's lazy load resumption steps to null. This cancels a
+    // > deferred lazy load, so that the navigation being started here is the one that is kept.
+    //
+    // <https://html.spec.whatwg.org/multipage/browsing-the-web.html#beginning-navigation>
+    if let Some(iframe) = window_proxy
+        .frame_element()
+        .and_then(|container| container.downcast::<HTMLIFrameElement>())
+    {
+        iframe.stop_lazy_loading(cx);
+    }
+
     // Step 12. If historyHandling is "auto", then:
     let history_handling = if history_handling == NavigationHistoryBehavior::Auto {
         // Step 12.1. If url equals navigable's active document's URL, and

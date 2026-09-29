@@ -13,7 +13,7 @@ use euclid::{Rect, SideOffsets2D, Size2D, Vector2D};
 use js::context::{JSContext, NoGC};
 use js::rust::{HandleObject, MutableHandleValue};
 use script_bindings::cell::DomRefCell;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
+use script_bindings::reflector::{Reflector, reflect_dom_object, reflect_dom_object_with_proto};
 use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_geometry::f32_rect_to_au_rect;
 use style::parser::Parse;
@@ -27,6 +27,7 @@ use crate::dom::bindings::callback::ExceptionHandling;
 use crate::dom::bindings::codegen::Bindings::IntersectionObserverBinding::{
     IntersectionObserverCallback, IntersectionObserverInit, IntersectionObserverMethods,
 };
+use crate::dom::bindings::codegen::Bindings::IntersectionObserverEntryBinding::IntersectionObserverEntryMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::codegen::UnionTypes::{DoubleOrDoubleSequence, ElementOrDocument};
 use crate::dom::bindings::error::{Error, Fallible};
@@ -39,6 +40,7 @@ use crate::dom::document::{Document, RenderingUpdateReason};
 use crate::dom::domrectreadonly::DOMRectReadOnly;
 use crate::dom::element::Element;
 use crate::dom::intersectionobserverentry::IntersectionObserverEntry;
+use crate::dom::node::virtualmethods::vtable_for;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::window::Window;
 
@@ -81,6 +83,12 @@ impl From<&UnrootedElementOrDocument> for ElementOrDocument {
 /// <https://w3c.github.io/IntersectionObserver/#intersectionobserver-intersection-root>
 pub type IntersectionRoot = Option<UnrootedElementOrDocument>;
 
+/// The implementation-defined scroll margin of the user agent's lazy load intersection observer,
+/// matching the value used by Chromium.
+///
+/// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#lazy-load-scroll-margin>
+const LAZY_LOAD_SCROLL_MARGIN: &str = "1250px";
+
 /// The Intersection Observer interface
 ///
 /// > The IntersectionObserver interface can be used to observe changes in the intersection
@@ -103,9 +111,12 @@ pub(crate) struct IntersectionObserver {
     /// > This callback will be invoked when there are changes to a target’s intersection
     /// > with the intersection root, as per the processing model.
     ///
+    /// This is `None` for the user agent's lazy load observer, which has no script callback and
+    /// resumes the deferred loading of its intersecting targets instead.
+    ///
     /// <https://w3c.github.io/IntersectionObserver/#intersection-observer-callback>
     #[conditional_malloc_size_of]
-    callback: Rc<IntersectionObserverCallback>,
+    callback: Option<Rc<IntersectionObserverCallback>>,
 
     /// <https://w3c.github.io/IntersectionObserver/#dom-intersectionobserver-queuedentries-slot>
     queued_entries: DomRefCell<Vec<Dom<IntersectionObserverEntry>>>,
@@ -148,7 +159,7 @@ impl IntersectionObserver {
             reflector_: Reflector::new(),
             owner_doc: window.Document().as_traced(),
             root: root.as_ref().map(|root| root.into()),
-            callback,
+            callback: Some(callback),
             queued_entries: Default::default(),
             observation_targets: Default::default(),
             root_margin: RefCell::new(root_margin),
@@ -208,6 +219,50 @@ impl IntersectionObserver {
         observer.init_observer(init)?;
 
         Ok(observer)
+    }
+
+    /// Create the user agent's lazy load intersection observer for `document`.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#lazy-load-intersection-observer>
+    pub(crate) fn new_lazy_load_observer(cx: &mut JSContext, document: &Document) -> DomRoot<Self> {
+        let lazy_load_scroll_margin = DOMString::from(LAZY_LOAD_SCROLL_MARGIN.to_string());
+        let lazy_load_margin = || {
+            parse_a_margin(Some(&lazy_load_scroll_margin))
+                .expect("the lazy load scroll margin should parse")
+        };
+        // The margin is applied to the root intersection rectangle as well as to the scrollports
+        // between the root and the target, so that an element in a nested scroll container is
+        // loaded once it comes near the viewport, like it is in other engines.
+        //
+        // > The options is an IntersectionObserverInit dictionary with the following
+        // > dictionary members: «[ "scrollMargin" → lazy load scroll margin ]».
+        let root_margin = lazy_load_margin();
+        let scroll_margin = lazy_load_margin();
+        // The implicit root is the top-level document, which is out of reach when it lives in
+        // another script thread: fall back to this document, so that a lazily loaded element
+        // inside a cross-origin frame still loads when it comes near its own viewport.
+        reflect_dom_object(
+            cx,
+            Box::new(Self {
+                reflector_: Reflector::new(),
+                owner_doc: Dom::from_ref(document),
+                root: document
+                    .window()
+                    .top_level_document_if_local()
+                    .is_none()
+                    .then(|| UnrootedElementOrDocument::Document(Dom::from_ref(document))),
+                callback: None,
+                queued_entries: Default::default(),
+                observation_targets: Default::default(),
+                root_margin: RefCell::new(root_margin),
+                scroll_margin: RefCell::new(scroll_margin),
+                thresholds: RefCell::new(vec![Finite::wrap(0.)]),
+                delay: Cell::new(0),
+                track_visibility: Cell::new(false),
+                connected_to_document: Cell::new(false),
+            }),
+            document.window(),
+        )
     }
 
     /// Step 5-13 of <https://w3c.github.io/IntersectionObserver/#initialize-new-intersection-observer>
@@ -278,7 +333,7 @@ impl IntersectionObserver {
     }
 
     /// <https://w3c.github.io/IntersectionObserver/#observe-target-element>
-    fn observe_target_element(&self, target: &Element, no_gc: &NoGC) {
+    pub(crate) fn observe_target_element(&self, target: &Element, no_gc: &NoGC) {
         // Step 1
         // > If target is in observer’s internal [[ObservationTargets]] slot, return.
         let is_present = self
@@ -317,7 +372,7 @@ impl IntersectionObserver {
     }
 
     /// <https://w3c.github.io/IntersectionObserver/#unobserve-target-element>
-    fn unobserve_target_element(&self, target: &Element, no_gc: &NoGC) {
+    pub(crate) fn unobserve_target_element(&self, target: &Element, no_gc: &NoGC) {
         // Step 1
         // > Remove the IntersectionObserverRegistration record whose observer property is equal to
         // > this from target’s internal [[RegisteredIntersectionObservers]] slot, if present.
@@ -415,9 +470,33 @@ impl IntersectionObserver {
             .collect();
 
         // Step 4-5
-        let _ = self
-            .callback
-            .Call_(cx, self, queued_entries, self, ExceptionHandling::Report);
+        match &self.callback {
+            Some(callback) => {
+                let _ = callback.Call_(cx, self, queued_entries, self, ExceptionHandling::Report);
+            },
+            // The user agent's lazy load observer has no script callback: its intersecting targets
+            // resume their deferred loading instead.
+            //
+            // <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#lazy-load-intersection-observer>
+            None => {
+                for entry in &queued_entries {
+                    // > If entry.isIntersecting is true, then set resumptionSteps to
+                    // > entry.target's lazy load resumption steps.
+                    if !entry.IsIntersecting() {
+                        continue;
+                    }
+
+                    let target = entry.Target();
+
+                    // > Stop intersection-observing a lazy loading element for entry.target.
+                    self.unobserve_target_element(&target, cx.no_gc());
+
+                    // > Set entry.target's lazy load resumption steps to null.
+                    // > Invoke resumptionSteps.
+                    vtable_for(target.upcast::<Node>()).run_lazy_load_resumption_steps(cx);
+                }
+            },
+        }
     }
 
     /// Connect the observer itself into owner doc if it is unconnected.
@@ -434,6 +513,7 @@ impl IntersectionObserver {
     fn disconnect_from_owner(&self) {
         if self.connected_to_document.get() {
             self.owner_doc.remove_intersection_observer(self);
+            self.connected_to_document.set(false);
         }
     }
 
